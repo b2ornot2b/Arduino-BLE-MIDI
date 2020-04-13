@@ -22,6 +22,15 @@ protected:
     bool _connected;
     
     uint8_t _midiPacket[5]; // outgoing
+
+
+    uint8_t *sysex_buf = NULL;
+    size_t sysex_buf_used = 0;
+    size_t sysex_buf_sz = 0;
+    size_t sysex_buf_chunk_sz = 1000;
+    bool sysExInProgress = false;
+
+    inline void sendSysExToHandler(uint8_t *buffer, size_t length);
     
 public:
     // callbacks
@@ -138,6 +147,11 @@ public:
     
     inline void sendMIDI(StatusByte, DataByte data1 = 0, DataByte data2 = 0);
     inline void receive(uint8_t *buffer, uint8_t bufferSize);
+    inline void appendToSysExBuf(uint8_t *buf, uint8_t buf_sz);
+    inline void handleSysExMsg(uint8_t *buffer, size_t bufferSize, size_t lPtr, size_t rPtr);
+
+    inline bool ensureSysExBufSz(uint8_t buf_sz);
+    inline void releaseSysExBuf();
 
     void onConnected(void(*fptr)()) {
         _connected = true;
@@ -224,10 +238,24 @@ bool BleMidiInterface::begin(const char* deviceName)
     return true;
 }
 
+void BleMidiInterface::sendSysExToHandler(uint8_t *buffer, size_t length)
+{
+    if (_sysExCallback) _sysExCallback(buffer, length);
+}
+
 void BleMidiInterface::sendMIDI(StatusByte status, DataByte data1, DataByte data2)
 {
     MidiType type   = getTypeFromStatusByte(status);
     Channel channel = getChannelFromStatusByte(status);
+
+    Serial.print("sendMIDI: ");
+    Serial.print(status);
+    Serial.print(" data1=");
+    Serial.print(data1);
+    Serial.print(" data2=");
+    Serial.println(data2);
+
+
 
     switch (type) {
         case NoteOff:
@@ -297,6 +325,105 @@ void BleMidiInterface::sendMIDI(StatusByte status, DataByte data1, DataByte data
     }
 }
 
+void BleMidiInterface::releaseSysExBuf(void)
+{
+#ifdef DEBUG_SYSEX
+    Serial.print("releaseSysExBuf buf=");
+    Serial.println(size_t(sysex_buf), HEX);
+#endif // DEBUG_SYSEX
+   
+    if (!sysex_buf)
+        return;
+    free(sysex_buf);
+    sysex_buf = NULL;
+
+    sysex_buf_used = 0;
+    sysex_buf_sz = 0;
+}
+
+void BleMidiInterface::appendToSysExBuf(uint8_t *buf, uint8_t buf_sz)
+{
+#ifdef DEBUG_SYSEX
+    Serial.println("appendToSysExBuf");
+#endif // DEBUG_SYSEX
+    if (!ensureSysExBufSz(buf_sz))
+    {
+        Serial.println("Cannot realloc");
+        Serial.println(sysex_buf_sz, HEX);
+    }
+    memcpy(sysex_buf + sysex_buf_used, buf, buf_sz);
+    sysex_buf_used += buf_sz;
+}
+   
+bool BleMidiInterface::ensureSysExBufSz(uint8_t buf_sz)
+{
+#ifdef DEBUG_SYSEX
+    Serial.println("ensureSysExBufSz");
+#endif
+    if ((sysex_buf_used + buf_sz) > sysex_buf_sz) {
+        auto n_chunks = size_t(ceil(float(sysex_buf_sz + buf_sz) / float(sysex_buf_chunk_sz)));
+
+#ifdef DEBUG_SYSEX
+        Serial.print("realloc sysex_buf n_chunks=");
+        Serial.print(n_chunks);
+        Serial.print(" : ");
+        Serial.print(sysex_buf_sz);
+#endif
+
+        sysex_buf_sz = sysex_buf_chunk_sz * n_chunks;
+
+#ifdef DEBUG_SYSEX
+        Serial.print(" -> ");
+        Serial.println(sysex_buf_sz);
+#endif
+        sysex_buf = (uint8_t *) realloc(sysex_buf, sysex_buf_sz);
+        if (!sysex_buf)
+            return false; 
+    }
+    return true;
+}
+
+void BleMidiInterface::handleSysExMsg(uint8_t *buffer, size_t bufferSize, size_t lPtr, size_t rPtr) 
+{
+    auto length = rPtr - lPtr;
+
+#ifdef DEBUG_SYSEX
+    Serial.print("SysEx: bufferSize=");
+    Serial.print(bufferSize);
+    Serial.print(" lPtr=");
+    Serial.print(lPtr);
+    Serial.print(" rPtr=");
+    Serial.print(rPtr);
+    Serial.print(" length=");
+    Serial.print(length);
+    Serial.print(" # @rPtr: ");
+    for (int i=0; i<3; i++) {
+        Serial.print(buffer[rPtr+i], HEX);
+        Serial.print(" ");
+    }
+    Serial.println();
+#endif
+
+    auto start = buffer + lPtr;
+
+    if (!sysExInProgress)
+        start++;
+
+    appendToSysExBuf(start, length);
+
+    if (buffer[rPtr+1] == 0xF7) {
+#ifdef DEBUG_SYSEX
+        Serial.println("Detected End of SysEx");
+#endif
+        sysExInProgress = false;
+        sendSysExToHandler(sysex_buf, sysex_buf_used);
+        releaseSysExBuf();
+    } else {
+        sysExInProgress = true;
+    }
+    return;
+}
+
 void BleMidiInterface::receive(uint8_t *buffer, uint8_t bufferSize)
 {
     /*
@@ -342,16 +469,64 @@ void BleMidiInterface::receive(uint8_t *buffer, uint8_t bufferSize)
     
     //While statement contains incrementing pointers and breaks when buffer size exceeded.
     while(1){
-        lastStatus = buffer[lPtr];
-        if( (buffer[lPtr] < 0x80) ){
-            //Status message not present, bail
-            return;
+
+#if 1 // def DEBUG_SYSEX
+        Serial.print("buffer= ");
+        for (int i=0; i<bufferSize; i++) {
+            Serial.print(i);
+            Serial.print(":");
+            Serial.print(buffer[i], (buffer[i] > 0x7F) ? HEX : DEC);
+            Serial.print(" ");
         }
-        //Point to next non-data byte
-        rPtr = lPtr;
-        while( (buffer[rPtr + 1] < 0x80)&&(rPtr < (bufferSize - 1)) ){
+        Serial.println();
+#endif
+
+
+
+        if (sysExInProgress) {
+#ifdef DEBUG_SYSEX
+            Serial.println("sysExInProgress...");
+#endif
+
+            --lPtr;
+            rPtr = lPtr;
+            while( (buffer[rPtr + 1] != 0xF7)&&(rPtr < (bufferSize - 0)) ){
+                rPtr++;
+            }
+
+#ifdef DEBUG_SYSEX
+            Serial.print(" lPtr=");
+            Serial.print(lPtr);
+            Serial.print(" rPtr=");
+            Serial.println(rPtr);
+#endif
+
+            handleSysExMsg(buffer, bufferSize, lPtr, rPtr);
+        }
+        else { // !sysExInProgress
+            lastStatus = buffer[lPtr];
+            if( buffer[lPtr] < 0x80 ){
+                //Status message not present, bail
+                return;
+            }
+            //Point to next non-data byte
+            rPtr = lPtr;
+            while( (buffer[rPtr + 1] < 0x80)&&(rPtr < (bufferSize - 1)) ){
+                rPtr++;
+            }
+        }
+
+        if (buffer[rPtr + 1] == 0xf7)
             rPtr++;
-        }
+
+#if 1 // def DEBUG_SYSEX
+            Serial.print(" lPtr=");
+            Serial.print(lPtr);
+            Serial.print(" rPtr=");
+            Serial.println(rPtr);
+#endif
+
+
         //look at l and r pointers and decode by size.
         if( rPtr - lPtr < 1 ){
             //Time code or system
@@ -378,6 +553,9 @@ void BleMidiInterface::receive(uint8_t *buffer, uint8_t bufferSize)
                     for(int i = lPtr; i < rPtr; i = i + 1)
                         sendMIDI(lastStatus, buffer[i + 1]);
                     break;
+                case 0xF0:
+                    handleSysExMsg(buffer, bufferSize, lPtr, rPtr);
+                   break;
                 default:
                     break;
             }
